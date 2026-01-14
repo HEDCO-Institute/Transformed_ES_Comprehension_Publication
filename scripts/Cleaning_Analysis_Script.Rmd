@@ -1,0 +1,1582 @@
+---
+title: "Cleaning/Analysis Script for Publication: Examining Comprehension of Meta-Analytic Effect Estimates"
+author: "Shaina Trevino"
+date: "2026-01-12"
+output: 
+  html_document: 
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(rio)
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(psych)
+library(knitr)
+library(gt)
+library(emmeans)
+library(effectsize)
+library(nnet)
+library(car)
+library(colorspace)
+
+```
+
+## Import
+
+```{r import}
+#import data
+cleaned_df <- import(here("data", "Cleaned full data 6.4.24.csv")) %>% 
+  janitor::clean_names() %>% 
+  filter(pid != "644bf248253fdfd230fa861f") # Remove test entry  
+
+#import demographic file
+demo_df <- import(here("data", "Cleaned demographic data 6.4.csv")) %>%
+  janitor::clean_names() %>% 
+  filter(participant_id != "644bf248253fdfd230fa861f") # Remove test entry 
+
+# Merge checks
+merged_df <- left_join(cleaned_df, demo_df, by = c("pid" = "participant_id")) %>%  #left join to exclude participants dropped due to failing attention checks
+  mutate(age = ifelse(age > 103, NA_real_, age)) #correct ages (105 and 104 was blank but exported as a wrong value)
+
+not_in_cleaned <- demo_df %>% 
+    rename(pid = participant_id) %>% 
+    anti_join(cleaned_df, by = "pid") # 2 participants with demographic data but no study data
+
+not_in_demo <- cleaned_df %>% 
+    rename(participant_id = pid) %>% 
+    anti_join(demo_df, by = "participant_id") # 3 participants with study data but no demographic data
+```
+
+## Tidy/Merge
+
+`pid` in survey data is the `participant_id` in the demographic data (Prolific IDs)
+
+```{r merge}
+full_td <- demo_df %>% 
+  rename(pid = participant_id) %>% 
+  right_join(cleaned_df, by = "pid") %>% #right join to exclude participants dropped due to failing
+  mutate(correct_comprehension_flag = case_when(more_or_less == "Less" ~ 1, 
+                                                more_or_less == "More" ~ 0,
+                                                more_or_less == "Unsure" ~ 0,
+                                                TRUE ~ NA_real_),
+         correct_comprehension_flag = factor(correct_comprehension_flag,
+                                             levels = c(0, 1),
+                                             labels = c("Incorrect", "Correct")),
+         precision_info_just_ci = factor(precision_info_just_ci,
+                                             levels = c(0, 1),
+                                             labels = c("No", "Yes")),
+         precision_info_ci_included_at_all = factor(precision_info_ci_included_at_all,
+                                             levels = c(0, 1),
+                                             labels = c("No", "Yes")),
+         effectiveness_cont = as.numeric(sub("([0-9]+).*", "\\1", effectiveness)),
+         precision_cont = as.numeric(sub("([0-9]+).*", "\\1", precision)),
+         group = factor(group, 
+                        levels = 1:6, 
+                        labels = c("SMD", "Cohen's U3", "CLES", "Risk ratio", 
+                                  "Number needed to treat", "IntHout probability of superiority")),
+         sex = factor(sex),
+         ethnicity_simplified = factor(ethnicity_simplified),
+         age = ifelse(age > 103, NA_real_, age)) #correct ages (105 and 104 was blank but exported as a wrong value)
+```
+
+## Sample Summary Descriptives
+
+OVERALL:
+
+```{r sample-overall}
+# Overall age (mean, sd)
+# demo_df %>%
+#   summarise(
+#     mean_age = mean(age, na.rm = TRUE),
+#     sd_age   = sd(age, na.rm = TRUE),
+#     min_age  = min(age, na.rm = TRUE),
+#     max_age  = max(age, na.rm = TRUE),
+#     n_missing_age = sum(is.na(age))
+#   )
+
+# Overall categorical variables with "Missing" as category
+# Helper function to tabulate with missing
+tab_with_missing <- function(df, var) {
+  df %>%
+    mutate({{ var }} := ifelse(is.na({{ var }}) | {{ var }} %in% c("DATA_EXPIRED", ""), 
+                               "Missing", as.character({{ var }}))) %>%
+    count({{ var }}) %>%
+    mutate(percent = 100 * n / sum(n))
+}
+
+sex_summary <- tab_with_missing(demo_df, sex)
+ethnicity_summary <- tab_with_missing(demo_df, ethnicity_simplified)
+country_summary <- tab_with_missing(demo_df, country_of_residence)
+employment_summary <- tab_with_missing(demo_df, employment_status)
+
+
+```
+
+
+BY GROUP:
+
+```{r sample-by-group}
+# Age
+# merged_df %>%
+#   group_by(group) %>%
+#   summarise(
+#     mean_age = mean(age, na.rm = TRUE),
+#     sd_age   = sd(age, na.rm = TRUE),
+#     min_age  = min(age, na.rm = TRUE),
+#     max_age  = max(age, na.rm = TRUE),
+#     n_missing_age = sum(is.na(age)),
+#     n = n()
+#   )
+
+# Helper function for categorical summary by group
+# overall-denominator version
+cat_by_group <- function(data, group, var) {
+  total_N <- nrow(data)  # overall denominator
+
+  data %>%
+    mutate(var_clean = ifelse(is.na({{ var }}) | {{ var }} %in% c("DATA_EXPIRED",""),
+                              "Missing", as.character({{ var }}))) %>%
+    count({{ group }}, var_clean, name = "n") %>%
+    mutate(percent = 100 * n / total_N)  # <-- overall denom
+}
+
+# By group x sex
+#cat_by_group(merged_df, group, sex)
+
+# By group x ethnicity
+#cat_by_group(merged_df, group, ethnicity_simplified)
+
+# By group x country of residence
+#cat_by_group(merged_df, group, country_of_residence)
+
+# By group x employment
+#cat_by_group(merged_df, group, employment_status)
+
+
+
+```
+
+FULL TABLE
+
+```{r full-summary-tbl}
+# ---------------- Sample size row ----------------
+make_sample_size_block <- function(data, group) {
+  total_N <- nrow(data)
+  group_sizes <- data %>% count({{ group }}, name = "n")
+
+  # one-row tibble: Characteristic | Overall | <group1> | <group2> | ...
+  bygrp_wide <- group_sizes %>%
+    tidyr::pivot_wider(names_from = {{ group }}, values_from = n)
+
+  tibble(Characteristic = "Sample size (n)", Overall = total_N) %>%
+    cbind(bygrp_wide)
+}
+
+# --------------- Categorical blocks --------------
+# Uses within-group denominators; Missing always shown last; levels sorted by overall n
+make_cat_block <- function(data, group, var, label = NULL) {
+  if (is.null(label)) label <- rlang::as_label(rlang::enquo(var))
+
+  d <- data %>%
+    mutate(level = ifelse(is.na({{ var }}) | {{ var }} %in% c("DATA_EXPIRED",""),
+                          "Missing", as.character({{ var }})))
+
+  total_N    <- nrow(d)
+  group_sizes <- d %>% count({{ group }}, name = "N_group")
+
+  # order levels by overall n, with Missing last
+  overall_counts <- d %>% count(level, name = "n") %>%
+    complete(level = union(level, "Missing"), fill = list(n = 0))
+  level_order <- overall_counts %>%
+    arrange(desc(n)) %>% pull(level) %>%
+    (\(x) c(setdiff(x, "Missing"), "Missing"))()
+
+  # Overall col (overall denominator)
+  overall <- overall_counts %>%
+    mutate(pct = 100 * n / total_N,
+           Overall = sprintf("%d (%.1f%%)", n, pct)) %>%
+    select(level, Overall) %>%
+    arrange(match(level, level_order))
+
+  # Group cols (within-group denominators)
+  by_grp <- d %>%
+    count({{ group }}, level, name = "n") %>%
+    complete({{ group }}, level = level_order, fill = list(n = 0)) %>%
+    left_join(group_sizes, by = rlang::as_name(rlang::ensym(group))) %>%
+    mutate(pct = 100 * n / N_group,
+           cell = sprintf("%d (%.1f%%)", n, pct)) %>%
+    select({{ group }}, level, cell) %>%
+    pivot_wider(names_from = {{ group }}, values_from = cell) %>%
+    arrange(match(level, level_order))
+
+  bind_rows(
+    tibble(Characteristic = label, Overall = NA_character_),
+    left_join(overall, by_grp, by = "level") %>%
+      transmute(Characteristic = paste0("  ", level),
+                Overall, across(-level, identity))
+  )
+}
+
+# ---------------- Age block (adds Missing) ----------------
+# Missing shown, with within-group denominators for group columns
+make_age_block_with_missing <- function(data, group) {
+  total_N <- nrow(data)
+  group_sizes <- data %>% count({{ group }}, name = "N_group")
+
+  # overall descriptive stats
+  over <- data %>%
+    summarise(
+      mean = mean(age, na.rm = TRUE),
+      sd   = sd(age, na.rm = TRUE),
+      min  = suppressWarnings(min(age, na.rm = TRUE)),
+      max  = suppressWarnings(max(age, na.rm = TRUE))
+    )
+
+  age_rows <- tibble(
+    Characteristic = c("Age, mean (SD)", "Age, range"),
+    Overall = c(sprintf("%.1f (%.1f)", over$mean, over$sd),
+                sprintf("%d–%d", over$min, over$max))
+  )
+
+  bygrp_stats <- data %>%
+    group_by({{ group }}) %>%
+    summarise(
+      mean = mean(age, na.rm = TRUE),
+      sd   = sd(age,   na.rm = TRUE),
+      min  = suppressWarnings(min(age, na.rm = TRUE)),
+      max  = suppressWarnings(max(age, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    transmute(
+      {{ group }},
+      `Age, mean (SD)` = sprintf("%.1f (%.1f)", mean, sd),
+      `Age, range`     = sprintf("%d–%d", min, max)
+    ) %>%
+    pivot_longer(-{{ group }}, names_to = "Characteristic", values_to = "val") %>%
+    pivot_wider(names_from = {{ group }}, values_from = val)
+
+  # Missing: overall (overall denom) + by group (within-group denom), show 0 (0.0%)
+  overall_miss <- sum(is.na(data$age))
+  overall_miss_cell <- sprintf("%d (%.1f%%)", overall_miss, 100 * overall_miss / total_N)
+
+  bygrp_miss <- data %>%
+    mutate(miss = is.na(age)) %>%
+    count({{ group }}, miss, name = "n") %>%
+    complete({{ group }}, miss = TRUE, fill = list(n = 0)) %>%  # ensures row exists for every group
+    filter(miss) %>%
+    left_join(group_sizes, by = rlang::as_name(rlang::ensym(group))) %>%
+    mutate(cell = sprintf("%d (%.1f%%)", n, 100 * n / N_group)) %>%
+    select({{ group }}, cell) %>%
+    pivot_wider(names_from = {{ group }}, values_from = cell)
+
+  bind_rows(
+    age_rows %>% left_join(bygrp_stats, by = "Characteristic"),
+    cbind(tibble(Characteristic = "  Missing", Overall = overall_miss_cell), bygrp_miss)
+  )
+}
+
+# ---------------- Numeracy block (adds Missing) ----------------
+# Missing shown, with within-group denominators for group columns
+make_numeracy_block_with_missing <- function(data, group) {
+  total_N <- nrow(data)
+  group_sizes <- data %>% count({{ group }}, name = "N_group")
+
+  # overall descriptive stats
+  over <- data %>%
+    summarise(
+      mean = mean(num_score, na.rm = TRUE),
+      sd   = sd(num_score,   na.rm = TRUE),
+      min  = suppressWarnings(min(num_score, na.rm = TRUE)),
+      max  = suppressWarnings(max(num_score, na.rm = TRUE))
+    )
+
+  num_rows <- tibble(
+    Characteristic = c("Numeracy score, mean (SD)", "Numeracy score, range"),
+    Overall        = c(sprintf("%.1f (%.1f)", over$mean, over$sd),
+                       sprintf("%g–%g", over$min, over$max))
+  )
+
+  bygrp_stats <- data %>%
+    group_by({{ group }}) %>%
+    summarise(
+      mean = mean(num_score, na.rm = TRUE),
+      sd   = sd(num_score,   na.rm = TRUE),
+      min  = suppressWarnings(min(num_score, na.rm = TRUE)),
+      max  = suppressWarnings(max(num_score, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    transmute(
+      {{ group }},
+      `Numeracy score, mean (SD)` = sprintf("%.1f (%.1f)", mean, sd),
+      `Numeracy score, range`     = sprintf("%g–%g", min, max)
+    ) %>%
+    pivot_longer(-{{ group }}, names_to = "Characteristic", values_to = "val") %>%
+    pivot_wider(names_from = {{ group }}, values_from = val)
+
+  # Missing: overall + by group
+  overall_miss <- sum(is.na(data$num_score))
+  overall_miss_cell <- sprintf(
+    "%d (%.1f%%)", overall_miss, 100 * overall_miss / total_N
+  )
+
+  bygrp_miss <- data %>%
+    mutate(miss = is.na(num_score)) %>%
+    count({{ group }}, miss, name = "n") %>%
+    complete({{ group }}, miss = TRUE, fill = list(n = 0)) %>%
+    filter(miss) %>%
+    left_join(group_sizes, by = rlang::as_name(rlang::ensym(group))) %>%
+    mutate(cell = sprintf("%d (%.1f%%)", n, 100 * n / N_group)) %>%
+    select({{ group }}, cell) %>%
+    pivot_wider(names_from = {{ group }}, values_from = cell)
+
+  bind_rows(
+    num_rows %>% left_join(bygrp_stats, by = "Characteristic"),
+    cbind(
+      tibble(Characteristic = "  Missing", Overall = overall_miss_cell),
+      bygrp_miss
+    )
+  )
+}
+
+# ---------------- Build your Table 1 ----------------
+sample_block <- make_sample_size_block(merged_df, group)
+age_block    <- make_age_block_with_missing(merged_df, group)
+num_block    <- make_numeracy_block_with_missing(merged_df, group)
+sex_block    <- make_cat_block(merged_df, group, sex, "Sex")
+eth_block    <- make_cat_block(merged_df, group, ethnicity_simplified, "Race/ethnicity")
+ctr_block    <- make_cat_block(merged_df, group, country_of_residence, "Country of residence")
+emp_block    <- make_cat_block(merged_df, group, employment_status, "Employment status")
+
+# Coerce all non-Characteristic columns to character so types align
+to_char <- function(df) dplyr::mutate(df, dplyr::across(-Characteristic, as.character))
+table1_df <- dplyr::bind_rows(
+  to_char(sample_block),
+  to_char(age_block),
+  to_char(num_block),
+  to_char(sex_block),
+  to_char(eth_block),
+  to_char(ctr_block),
+  to_char(emp_block)
+)
+
+table1_df[is.na(table1_df)] <- ""
+
+table1_gt <- gt(table1_df) |>
+  tab_header(title = "Participant Demographics (Overall and by Group)") |>
+  cols_label(Characteristic = "Characteristic", Overall = "Overall",
+             `1` = "SMD", `2` = "CU3", `3` = "CLES", `4` = "RR", `5` = "NNT", `6` = "IntHout") |>
+  tab_options(table.font.size = "small")
+
+table1_gt
+
+#gtsave(table1_gt, here::here("outputs/participant_demographics.png"))
+
+
+
+```
+
+
+## Results 
+
+### Descriptively: Do groups differ in their ES comprehension
+1. Are education practitioners able to accurately interpret each effect size? 
+
+  - Describe the proportion of participants that were able to answer `more_or_less` interpretation question correctly in each group? 
+
+```{r subset}
+#select analysis variables
+rq1_df <- full_td %>% 
+  select(pid, group, more_or_less, correct_comprehension_flag, num_score, age, sex, ethnicity_simplified)
+```
+    
+```{r rq1-descriptive}
+correct_prop <- rq1_df %>%
+  group_by(group) %>%
+  mutate(group_total = n()) %>%
+  group_by(group, correct_comprehension_flag) %>%
+  summarize(n = n(),
+            percent = paste0(round(n / first(group_total) * 100, 2), "%")) %>% 
+  mutate(n_percent = paste0(n, " (", percent, ")")) %>%
+  arrange(n) %>% 
+  select(-n, -percent) %>% 
+  pivot_wider(names_from = correct_comprehension_flag,
+    values_from = n_percent) %>% 
+  select(group, Correct, Incorrect)
+
+correct_prop
+
+```
+
+
+
+### RQ1: How does participant comprehension of the effect vary by effect size presented? (From F&T: "are participants able to accurately interpret each ES" which type of ES lead to most accurate understanding")
+
+Outcome: effect size comprehension (`more_or_less`)
+ - Q: Did students in the depression prevention programs report more or less depression symptoms after participating?
+   - Options: More, Less, Unsure
+   - Correct response: Less 
+
+ES Groups (based on the effect size the participant sees; `group`): 
+ - 1 = SMD 
+ - 2 = Cohen’s U3 
+ - 3 = CLES 
+ - 4 = Risk ratio 
+ - 5 = Number needed to treat 
+ - 6 = IntHout probability of superiority (PSES) 
+
+Analysis plan: multinomial regression with categorical outcome
+Covariates:
+ - Numeracy level (1-9): `num_score`
+ - Age (continuous variable): `age`
+ - Sex (male/female): `sex`
+ - Race/ethnicity (White, Mixed, Asian, Black and Other): `ethnicity_simplified`
+ 
+```{r updated-analysis-categocial-comprehension}
+# create factors
+rq1_df2 <- rq1_df %>%
+  mutate(
+    comprehension_cat = case_when(
+      more_or_less == "Less" ~ "Correct",
+      more_or_less == "More" ~ "Incorrect",
+      more_or_less == "Unsure" ~ "Unsure",
+      TRUE ~ NA_character_
+    ),
+    comprehension_cat = factor(
+      comprehension_cat,
+      levels = c("Correct", "Incorrect", "Unsure")
+    )
+  ) %>%
+  filter(complete.cases(comprehension_cat, group, num_score, age, sex, ethnicity_simplified)) # 5 cases dropped
+
+
+
+# descriptives
+desc_tab <- rq1_df2 %>%
+  count(group, comprehension_cat) %>%
+  group_by(group) %>%
+  mutate(pct = 100*n/sum(n)) %>%
+  ungroup()
+
+desc_tab
+
+## make into table
+# 1) Count + percent, keep all combos (including 0s)
+desc_wide <- rq1_df2 %>%
+  mutate(
+    # choose your display order here:
+    comprehension_cat = factor(
+      comprehension_cat,
+      levels = c("Unsure", "Incorrect", "Correct")
+    )
+  ) %>%
+  count(group, comprehension_cat, .drop = FALSE) %>%
+  group_by(group) %>%
+  mutate(
+    pct   = 100 * n / sum(n),
+    cell  = sprintf("%d (%.1f%%)", n, pct),
+    total = sum(n)
+  ) %>%
+  ungroup() %>%
+  select(group, total, comprehension_cat, cell) %>%
+  pivot_wider(
+    names_from  = comprehension_cat,
+    values_from = cell,
+    values_fill = "0 (0.0%)"
+  ) %>%
+  arrange(group)
+
+# 2) Make the gt table
+gt_desc_tbl <- gt(desc_wide) %>%
+  cols_label(
+    group    = "Group",
+    total    = "Total N",
+    Unsure   = "Unsure",
+    Incorrect= "Incorrect",
+    Correct  = "Correct"
+  ) %>%
+  cols_align(align = "center", columns = -group) %>%
+  tab_header(
+    title = "Comprehension by Group",
+    #subtitle = "Cells show count (row %) within each group"
+  ) %>%
+  tab_options(table.font.size = px(13))
+
+gt_desc_tbl
+
+
+# Updated analysis on 11/6/25 to run multinomial logistic regression with emmeans to include covariates and get tukey comparisons
+mn_df <- rq1_df2 %>% 
+  rename(es_group = group)
+
+fit_mn <- multinom(
+  comprehension_cat ~ es_group + num_score + age + sex + ethnicity_simplified,
+  data = mn_df, trace = FALSE, Hess = TRUE
+)
+summary(fit_mn)
+confint(fit_mn)
+
+# ORs
+exp(coef(fit_mn))
+
+# OR CIs
+exp(confint(fit_mn))
+
+# Omnibus likelihood-ratio test (chi-square overall)
+ancova_mn <- car::Anova(fit_mn, type = 3)
+ancova_mn
+
+# N included in model
+sum(complete.cases(mn_df[, c(
+  "comprehension_cat",
+  "es_group",
+  "num_score",
+  "age",
+  "sex",
+  "ethnicity_simplified"
+)]))
+
+
+# (3) Estimated marginal means for each group × outcome
+emm_rq1_mn <- emmeans(fit_mn, ~ es_group | comprehension_cat, type = "response")
+
+# (4) All pairwise Tukey contrasts *for each outcome category*
+pairs_all <- contrast(emm_rq1_mn, "pairwise", by = "comprehension_cat", adjust = "tukey") %>%
+  summary(infer = TRUE, type = "response")
+
+pairs_all
+
+
+
+```
+
+
+### RQ2: How do participants rate the programs in terms of effectiveness based on the effect size presented? 
+
+Outcome: effectiveness of ES (`effectiveness`)
+ - Q: How effective were the programs at reducing depression symptoms? 
+   - Options: 0 (Not at all) - 6 (Very); 3 = Somewhat
+   - Continuous score
+
+ES Groups (based on the effect size the participant sees; `group`): 
+ - 1 = SMD 
+ - 2 = Cohen’s U3 
+ - 3 = CLES 
+ - 4 = Risk ratio 
+ - 5 = Number needed to treat 
+ - 6 = IntHout probability of superiority (PSES)
+
+Analysis plan: ANCOVA with Tukey adjustment for contrasts
+Covariates:
+ - Numeracy level (1-9): `num_score`
+ - Age (continuous variable): `age`
+ - Sex (male/female): `sex`
+ - Race/ethnicity (White, Mixed, Asian, Black and Other): `ethnicity_simplified`
+
+```{r rq2-subset}
+rq2_df <- full_td %>% 
+  select(pid, group, effectiveness_cont, num_score, age, sex, ethnicity_simplified)
+```
+
+```{r ancova-updated-tukey-adjusted}
+# updated analysis on 11/7/25 to run adjusted Tukey comparison
+fit_rq2 <- lm(
+  effectiveness_cont ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq2_df
+)
+
+summary(fit_rq2)
+
+# Omnibus ANCOVA
+anova_rq2 <- car::Anova(fit_rq2, type = 2)
+anova_rq2
+
+eta_sq_rq2 <- effectsize::eta_squared(anova_rq2, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_rq2
+
+# Adjusted means
+emm_rq2 <- emmeans(fit_rq2, ~ group)
+
+# Tukey pairwise comparisons on adjusted means
+rq2_pairs <- pairs(emm_rq2, adjust = "tukey")
+
+rq2_pairs_ci <- pairs(
+  emm_rq2,
+  adjust = "tukey"
+) %>%
+  summary(infer = TRUE)
+rq2_pairs_ci
+
+
+# Adjusted means - Race
+emm_rq2_race <- emmeans(fit_rq2, ~ ethnicity_simplified)
+
+# Tukey pairwise comparisons on adjusted means
+rq2_pairs_race <- pairs(emm_rq2_race, adjust = "tukey")
+rq2_pairs_race
+
+
+```
+
+
+```{r plot-options}
+ggplot(rq2_df, aes(x = group, y = effectiveness_cont, fill = group)) +
+  geom_boxplot(alpha = 0.6, width = 0.6, outlier.shape = NA, color = "gray40") +
+  geom_jitter(aes(color = group), width = 0.15, alpha = 0.6, size = 2) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  stat_compare_means(method = "anova", label.y = 6.5, size = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    x = "Effect Size Type",
+    y = "Perceived Effectiveness (0–6)",
+    title = "Perceived Effectiveness by Effect Size Type",
+    caption = "Boxes show median and interquartile range; dots show individual ratings"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+# transposed dot
+plot_df <- rq2_df %>%
+  group_by(group) %>%
+  summarise(
+    mean = mean(effectiveness_cont, na.rm = TRUE),
+    se   = sd(effectiveness_cont, na.rm = TRUE) / sqrt(sum(!is.na(effectiveness_cont))),
+    n    = sum(!is.na(effectiveness_cont))
+  ) %>%
+  mutate(
+    group = factor(group,
+                   levels = c("SMD", "Cohen's U3", "CLES",
+                              "Risk ratio", "Number needed to treat",
+                              "IntHout probability of superiority"))
+  )
+
+ggplot(plot_df, aes(y = group, x = mean, color = group)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(xmin = mean - 1.96 * se, xmax = mean + 1.96 * se),
+                width = 0.2, orientation = "y") +   # <-- fixed line
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    x = "Perceived Effectiveness (Mean ± 95% CI)",
+    y = "Effect Size Type",
+    title = "Perceived Effectiveness by Effect Size Type",
+    caption = "Points show group means; bars show 95% confidence intervals"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.caption = element_text(size = 10, color = "gray40")
+  )
+
+
+```
+
+
+### RQ3: How does participant comprehension of the precision of the effect vary by effect size presented?
+
+Outcome: precision comprehension (`precision`)
+ - Q: How precise are these findings? In other words, how sure can we be that the effect is XX?
+ - Options: 0 (Not at all) - 6 (Very); 3 = Somewhat
+ - Continuous score
+ 
+ES Groups (based on the effect size the participant sees; `group`): 
+ - 1 = SMD 
+ - 2 = Cohen’s U3 
+ - 3 = CLES 
+ - 4 = Risk ratio 
+ - 5 = Number needed to treat 
+ - 6 = IntHout probability of superiority (PSES)
+
+Analysis plan: ANCOVA with Tukey adjustment for contrasts
+Covariates:
+ - Numeracy level (1-9): `num_score`
+ - Age (continuous variable): `age`
+ - Sex (male/female): `sex`
+ - Race/ethnicity (White, Mixed, Asian, Black and Other): `ethnicity_simplified`
+ 
+```{r rq3-subset}
+rq3_df <- full_td %>% 
+  select(pid, group, precision_cont, num_score, age, sex, ethnicity_simplified)
+```
+
+```{r ancova2}
+# Updated analysis on 11/7/25 to get adjusted tukey mean comparisons
+fit_rq3 <- lm(
+  precision_cont ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq3_df
+)
+summary(fit_rq3)
+
+anova_rq3 <- car::Anova(fit_rq3, type = 2)
+anova_rq3
+
+emm_rq3 <- emmeans(fit_rq3, ~ group)
+
+eta_sq_rq3 <- effectsize::eta_squared(anova_rq3, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_rq3
+
+pairs_rq3 <- pairs(emm_rq3, adjust = "tukey")
+
+pairs_rq3_ci <- pairs(emm_rq3, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_rq3_ci
+
+
+```
+
+```{r boxplot3}
+# Point plot
+# summarize
+# summarize means + CIs
+plot_df <- rq3_df %>%
+  group_by(group) %>%
+  summarise(
+    mean = mean(precision_cont, na.rm = TRUE),
+    se   = sd(precision_cont, na.rm = TRUE) / sqrt(sum(!is.na(precision_cont))),
+    n    = sum(!is.na(precision_cont)),
+    .groups = "drop"
+  )
+
+ggplot(plot_df, aes(x = group, y = mean, color = group)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = mean - 1.96*se, ymax = mean + 1.96*se),
+                width = 0.15, linewidth = 1) +
+  labs(
+    x = "Effect size type",
+    y = "Perceived precision (Mean ± 95% CI)",
+    title = "Perceived Precision by Effect Size Type",
+    caption = "Points show group means; bars show 95% confidence intervals"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+
+# Boxplot with jitter
+ggplot(rq3_df, aes(x = group, y = precision_cont, fill = group)) +
+  geom_boxplot(alpha = 0.65, width = 0.6, outlier.shape = NA, color = "gray40") +
+  geom_jitter(aes(color = group), width = 0.15, alpha = 0.5, size = 2) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  labs(
+    x = "Effect size type",
+    y = "Perceived precision (0–6)",
+    title = "Distribution of Perceived Precision by Effect Size Type",
+    caption = "Boxes: median & IQR; dots: individual ratings; diamond: mean"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+
+```
+
+
+### RQ4: How do participants rate the ease of 6 different domains? 
+
+Outcomes: 6 different domains:
+ - Options: 0 (Strongly disagree) - 6 (Strongly agree); 3 = Neither
+ - Continuous scores
+   - Understandability (`understandable`): The information given about the programs is easy to understand.  
+   - Helpfulness (`helpful`): The information given about the programs is helpful to judge how effective the program was.  
+   - Actionable (`actionable`): The findings presented are actionable (I know what to do with them). 
+   - Concise (`concise`): The findings presented are concise (short and to the point). 
+   - Credible (`credible`): The findings presented are credible or trustworthy. 
+   - Recommendation (`recommendation`): I am likely to recommend that schools implement these programs. 
+ 
+ES Groups (based on the effect size the participant sees; `group`): 
+ - 1 = SMD 
+ - 2 = Cohen’s U3 
+ - 3 = CLES 
+ - 4 = Risk ratio 
+ - 5 = Number needed to treat 
+ - 6 = IntHout probability of superiority (PSES)
+
+Analysis plan: separate ANCOVA with Tukey adjustment for contrasts
+Covariates:
+ - Numeracy level (1-9): `num_score`
+ - Age (continuous variable): `age`
+ - Sex (male/female): `sex`
+ - Race/ethnicity (White, Mixed, Asian, Black and Other): `ethnicity_simplified`
+
+#### Separate ANCOVA models per domain
+
+```{r rq4-subset}
+rq4_df <- full_td %>% 
+  select(pid, group, understandable, helpful, actionable, concise, credible, recommendation,
+         num_score, age, sex, ethnicity_simplified, effectiveness_cont, precision_cont) %>% 
+  mutate(across(c(understandable, helpful, actionable, concise, credible, recommendation), 
+                ~ case_when(tolower(.) == "strongly disagree" ~ 0,
+                            tolower(.) == "disagree" ~ 1,
+                            tolower(.) == "somewhat disagree" ~ 2,
+                            tolower(.) == "neither agree or disagree" ~ 3,
+                            tolower(.) == "somewhat agree" ~ 4,
+                            tolower(.) == "agree" ~ 5,
+                            tolower(.) == "strongly agree" ~ 6,
+                            TRUE ~ NA_real_)))
+```
+
+```{r separate-ANCOVAs}
+# Updated 11/10/25 to run with adjusted Tukey correction
+
+# UNDERSTANDABLE -----------------------------------
+
+# LM model
+fit_understandable <- lm(
+  understandable ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+summary(fit_understandable)
+
+# Type II ANCOVA
+anova_understandable <- car::Anova(fit_understandable, type = 2)
+anova_understandable
+
+# # Adjusted means (EMMs)
+emm_understandable <- emmeans(fit_understandable, ~ group)
+emm_understandable
+
+# Eta-squared
+eta_sq_understandable <- eta_squared(anova_understandable, partial = FALSE,   # gives generalized η²
+                                     generalized = TRUE, ci = 0.95)
+eta_sq_understandable
+
+# Tukey on adjusted means
+pairs_understandable <- pairs(emm_understandable, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_understandable
+
+# HELPFUL -----------------------------------------------
+
+fit_helpful <- lm(
+  helpful ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+summary(fit_helpful)
+
+
+anova_helpful <- car::Anova(fit_helpful, type = 2)
+anova_helpful
+
+eta_sq_helpful <- effectsize::eta_squared(anova_helpful, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_helpful
+
+emm_helpful <- emmeans(fit_helpful, ~ group)
+ emm_helpful
+
+pairs_helpful <- pairs(emm_helpful, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_helpful
+
+
+# ACTIONABLE ---------------------------------------------
+
+fit_actionable <- lm(
+  actionable ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+summary(fit_actionable)
+
+anova_actionable <- car::Anova(fit_actionable, type = 2)
+anova_actionable
+
+eta_sq_actionable <- effectsize::eta_squared(anova_actionable, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_actionable
+
+emm_actionable <- emmeans(fit_actionable, ~ group)
+ emm_actionable
+
+pairs_actionable <- pairs(emm_actionable, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_actionable
+
+# race
+emm_actionable_race <- emmeans(fit_actionable, ~ ethnicity_simplified)
+ emm_actionable_race
+
+pairs_actionable_race <- pairs(emm_actionable_race, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_actionable_race
+
+
+# CONCISE -------------------------------------------------
+
+fit_concise <- lm(
+  concise ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+summary(fit_concise)
+
+anova_concise <- car::Anova(fit_concise, type = 2)
+anova_concise
+
+eta_sq_concise <- effectsize::eta_squared(anova_concise, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_concise
+
+emm_concise <- emmeans(fit_concise, ~ group)
+ emm_concise
+
+pairs_concise <- pairs(emm_concise, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_concise
+
+
+# CREDIBLE -------------------------------------------------------
+
+fit_credible <- lm(
+  credible ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+summary(fit_credible)
+
+anova_credible <- car::Anova(fit_credible, type = 2)
+anova_credible
+
+eta_sq_credible <- effectsize::eta_squared(anova_credible, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_credible
+
+emm_credible <- emmeans(fit_credible, ~ group)
+ emm_credible
+
+pairs_credible <- pairs(emm_credible, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_credible
+
+
+# RECOMMENDED ---------------------------------------------------
+
+fit_recommendation <- lm(
+  recommendation ~ group + num_score + age + sex + ethnicity_simplified,
+  data = rq4_df
+)
+
+summary(fit_recommendation)
+
+anova_recommendation <- car::Anova(fit_recommendation, type = 2)
+anova_recommendation
+
+eta_sq_recommendation <- effectsize::eta_squared(anova_recommendation, partial = FALSE, generalized = TRUE, ci = 0.95)
+eta_sq_recommendation
+
+emm_recommendation <- emmeans(fit_recommendation, ~ group)
+ emm_recommendation
+
+pairs_recommendation <- pairs(emm_recommendation, adjust = "tukey") %>% 
+  summary(infer = TRUE)
+pairs_recommendation
+
+
+```
+
+# Descriptive tables
+
+```{r descriptives-prep}
+#means, SD for likert outcomes by group (RAW)
+group_stats <- rq4_df %>% 
+  group_by(group) %>% 
+  summarize(mean_effectiveness = mean(effectiveness_cont, na.rm = TRUE),
+            sd_effectiveness = sd(effectiveness_cont, na.rm = TRUE),
+            mean_precision = mean(precision_cont, na.rm = TRUE),
+            sd_precision = sd(precision_cont, na.rm = TRUE),
+            mean_understandable = mean(understandable, na.rm = TRUE),
+            sd_understandable = sd(understandable, na.rm = TRUE),
+            mean_helpful = mean(helpful, na.rm = TRUE),
+            sd_helpful = sd(helpful, na.rm = TRUE),
+            mean_actionable = mean(actionable, na.rm = TRUE),
+            sd_actionable = sd(actionable, na.rm = TRUE),
+            mean_concise = mean(concise, na.rm = TRUE),
+            sd_concise = sd(concise, na.rm = TRUE),
+            mean_credible = mean(credible, na.rm = TRUE),
+            sd_credible = sd(credible, na.rm = TRUE),
+            mean_recommend = mean(recommendation, na.rm = TRUE),
+            sd_recommend = sd(recommendation, na.rm = TRUE))
+
+group_nas <- rq4_df %>%
+  group_by(group) %>%
+  summarise(across(
+    c(effectiveness_cont, precision_cont, understandable,
+      helpful, actionable, concise, credible, recommendation),
+    .fns = list(
+      valid = ~sum(!is.na(.)),
+      missing = ~sum(is.na(.))
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  pivot_longer(
+    -group,
+    names_to = c("variable", ".value"),
+    names_pattern = "(.*)_(valid|missing)"
+  )
+
+group_nas
+
+# Convert to long format
+summary_stats_long <- group_stats %>%
+  pivot_longer(
+    cols = starts_with("mean_"),
+    names_to = "variable",
+    names_prefix = "mean_",
+    values_to = "mean"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("sd_"),
+    names_to = "variable_sd",
+    names_prefix = "sd_",
+    values_to = "sd"
+  ) %>%
+  filter(variable == variable_sd) %>%
+  select(-variable_sd) %>%
+  mutate(mean_sd = paste0(round(mean, 2), " (", round(sd, 2), ")")) %>%
+  select(group, variable, mean_sd)
+
+# Pivot back to wide format for presentation
+summary_stats_final <- summary_stats_long %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = mean_sd)
+
+
+```
+
+```{r descriptives, results = 'asis'}
+
+# View the final formatted table
+summary_stats_final %>%
+  kable(
+    caption = "Summary Statistics by Group (Mean (SD))",
+    col.names = c("Group", "Effectiveness", "Precision", "Understandable", "Helpful", 
+                  "Actionable", "Concise", "Credible", "Recommendation"))
+
+# Gt table
+summary_stats_final %>%
+  gt() %>%
+  tab_header(
+    title = "Average rating for each domain (Mean (SD))"
+  ) %>%
+  cols_label(
+    group          = "Group",
+    effectiveness  = "Effectiveness",
+    precision      = "Precision",
+    understandable = "Understandable",
+    helpful        = "Helpful",
+    actionable     = "Actionable",
+    concise        = "Concise",
+    credible       = "Credible",
+    recommend = "Recommendation"
+  ) %>%
+  cols_width(
+    group ~ px(120),               # wider for group name
+    everything() ~ px(110)         # widen all numeric columns
+  ) %>%
+  tab_options(
+    table.font.size = "small",
+    data_row.padding = px(6),      # adds vertical space
+    column_labels.padding = px(8)  # adds padding in headers
+  ) %>%
+  cols_align(
+    align = "center", columns = everything()
+  ) %>% 
+  tab_source_note("Note: No missing data were observed among these variables for any group")
+```
+
+```{r adjusted-means-tables}
+# Descriptives with adjusted values
+# Labels for columns
+var_labels <- c(
+  effectiveness_cont = "Effectiveness",
+  precision_cont     = "Precision",
+  understandable     = "Understandable",
+  helpful            = "Helpful",
+  actionable         = "Actionable",
+  concise            = "Concise",
+  credible           = "Credible",
+  recommendation     = "Recommendation"
+)
+
+# Function to format mean(SE) or prob(SE)
+fmt_mean_se <- function(m, se, digits=2){
+  paste0(round(m, digits), " (", round(se, digits), ")")
+}
+
+#List of continuous outcomes to summarize with adjusted means
+cont_outcomes <- c(
+  "effectiveness_cont","precision_cont",
+  "understandable","helpful","actionable","concise","credible","recommendation"
+)
+
+#Function to compute EMMs for a single continuous outcome
+get_emm_cont <- function(outcome, dat = rq4_df){
+  #Drop rows with missing in outcome or covariates
+  vars_needed <- c("group","num_score","age","sex","ethnicity_simplified", outcome)
+  dd <- dat %>% dplyr::select(all_of(vars_needed)) %>% na.omit()
+
+  #ANCOVA
+  fit <- lm(reformulate(c("group","num_score","age","sex","ethnicity_simplified"), outcome), data = dd)
+
+  #EMMs by group
+  emm <- emmeans(fit, ~ group)
+  out <- as_tibble(summary(emm)) %>%
+    transmute(
+      group = as.character(group),
+      variable = outcome,
+      adj_mean = emmean,
+      adj_se = SE,
+      ci_low = lower.CL,
+      ci_high = upper.CL,
+      display = fmt_mean_se(emmean, SE)
+    )
+  out
+}
+
+#Compute EMMs for all continuous outcomes
+emm_all_cont <- map_dfr(cont_outcomes, get_emm_cont)
+
+#Pivot to wide like your raw table
+emm_cont_wide <- emm_all_cont %>%
+  mutate(variable = dplyr::recode(variable, !!!var_labels)) %>%
+  select(group, variable, display) %>%
+  pivot_wider(names_from = variable, values_from = display)
+
+#GT table
+gt_cont <- emm_cont_wide %>%
+  mutate(group = case_when(
+    group == "Cohen's U3" ~ "U<sub>3</sub>",
+    group == "Risk Ratio" ~ "RR",
+    group == "Number needed to treat" ~ "NNT",
+    group == "IntHout probability of superiority" ~ "PSES",
+    TRUE ~ as.character(group)
+  )) %>% 
+  gt() %>%
+  tab_header(title = "Adjusted Means by Group, M-adj (SE of pairwise differences)") %>%
+  cols_label(
+    group = "Group",
+    `Effectiveness`  = "Effectiveness",
+    `Precision`      = "Precision",
+    `Understandable` = "Understandable",
+    `Helpful`        = "Helpful",
+    `Actionable`     = "Actionable",
+    `Concise`        = "Concise",
+    `Credible`       = "Credible",
+    `Recommendation` = "Recommendation"
+  ) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  cols_width(group ~ px(140), everything() ~ px(120)) %>%
+  tab_options(table.font.size = "small") %>% 
+  fmt_markdown(columns = group)
+
+gt_cont
+
+#Estimated probabilities by group × outcome
+emm_rq1_mn <- emmeans(fit_mn, ~ es_group | comprehension_cat, type = "response")
+
+#Make wide: columns for Correct, Incorrect, Unsure with p_adj(SE)
+rq1_mn_tbl <- 
+  as_tibble(summary(emm_rq1_mn)) %>%
+  # Clean category labels
+  mutate(
+    group = as.character(es_group),
+    category = str_trim(as.character(comprehension_cat)),  
+    disp = fmt_mean_se(prob, SE)
+  ) %>%
+  select(group, category, disp) %>%
+  # Ensure factor levels are exactly correct and in order
+  mutate(category = factor(category, 
+                           levels = c("Correct", "Incorrect", "Unsure"))) %>%
+  pivot_wider(
+    names_from = category,
+    values_from = disp
+  ) %>%
+  arrange(group)
+
+gt_rq1_mn <- rq1_mn_tbl %>%
+  gt() %>%
+  tab_header(title = "Adjusted Probabilities by Group and Outcome (Mean_adj (SE))") %>%
+  cols_label(
+    group    = "Group",
+    Correct  = "Correct",
+    Incorrect= "Incorrect",
+    Unsure   = "Unsure"
+  ) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  cols_width(group ~ px(160), everything() ~ px(140)) %>%
+  tab_options(table.font.size = "small")
+
+gt_rq1_mn
+
+# percent with SE%
+gt(
+  rq1_mn_tbl %>%
+  arrange(desc(Correct)) %>% 
+  mutate(across(c(Correct, Incorrect, Unsure),
+                ~str_replace_all(.x, "([0-9.]+) \\(([0-9.]+)\\)", 
+                                 function(m) {
+                                   p <- as.numeric(sub(" .*", "", m))
+                                   se <- as.numeric(sub(".*\\((.*)\\).*", "\\1", m))
+                                   sprintf("%.0f%% (%.0f%%)", 100*p, 100*se)
+                                 })))
+) %>% 
+  tab_header(title = "Adjusted Percentages by Group and Outcome (Mean_adj (SE))") 
+
+
+
+
+```
+
+
+# Full Boxplot Figure
+
+```{r all_outcomes_boxplot_final, message=FALSE, warning=FALSE, fig.width=10, fig.height=15, results = 'asis'}
+set.seed(12042025)
+
+light_berry <- lighten("#8D1D58", amount = 0.3)
+light_dblue <- lighten("#004F6E", amount = 0.4)
+light_lblue <- lighten("#00A5B5", amount = 0.2)
+test <- lighten("#e6652f", amount = 0.2)
+
+my_colors <- c(
+  "SMD"                                   = "#8ABB40",
+  "Cohen's U3"                            = light_dblue,
+  "CLES"                                  = "#FEE11A",
+  "Risk ratio"                            = "#FF7C4E",
+  "Number needed to treat"                = light_berry,
+  "IntHout probability of superiority"    = light_lblue
+)
+
+# Long data ------------------------------------------------------------
+plot_long <- rq4_df %>% 
+  select(
+    group,
+    effectiveness_cont,
+    precision_cont,
+    understandable,
+    helpful,
+    actionable,
+    concise,
+    credible,
+    recommendation
+  ) %>% 
+  pivot_longer(
+    cols = -group,
+    names_to = "outcome",
+    values_to = "score"
+  ) %>% 
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+      "actionable",
+      "concise",
+      "credible",
+      "helpful",
+      "precision_cont",
+      "understandable",
+      "effectiveness_cont",
+      "recommendation"
+    ),
+    labels = c(
+      "Actionable",
+      "Concise",
+      "Credible",
+      "Helpful",
+      "Precise",
+      "Understandable",
+      "Effective",
+      "Recommended"
+    )
+  ),
+    group = factor(
+      group,
+      levels = c(
+        "SMD",
+        "Cohen's U3",
+        "CLES",
+        "Risk ratio",
+        "Number needed to treat",
+        "IntHout probability of superiority"
+      )
+    )
+  )
+
+# Plotmath labels for ES (top axis; U3 subscript)
+es_label_map <- c(
+  "SMD"                                   = "SMD",
+  "Cohen's U3"                            = "U[3]",
+  "CLES"                                  = "CLES",
+  "Risk ratio"                            = "RR",
+  "Number needed to treat"                = "NNT",
+  "IntHout probability of superiority"    = "PSES"
+)
+es_breaks <- names(es_label_map)
+
+# Build the plot object 
+all_outcomes_box <- ggplot(
+  plot_long,
+  aes(x = group, y = score, fill = group)
+) +
+  geom_boxplot(
+    alpha = 0.25,
+    width = 0.5,
+    outlier.shape = NA,
+    color = "gray40",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = group),
+    width = 0.15,
+    alpha = 0.3,
+    size = 1.6
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 18,
+    size = 3,
+    color = "black"
+  ) +
+  facet_wrap(
+    ~ outcome,
+    ncol = 2,
+    strip.position = "left"
+  ) +
+  scale_fill_manual(values = my_colors) +
+  scale_color_manual(values = my_colors) +
+  labs(
+    x = NULL,
+    y = NULL,
+    caption = "Boxes = median & IQR; dots = individual ratings; diamonds = means."
+  ) +
+  scale_y_continuous(
+  limits = c(0, 6.5),
+  breaks = 0:6,
+  minor_breaks = NULL,   
+  position = "right"
+) +
+scale_x_discrete(
+  position = "top",
+  labels = function(x) parse(text = es_label_map[x])
+) +
+theme_minimal(base_size = 14) +
+theme(
+  legend.position = "none",
+
+  axis.text.x.top = element_text(face = "bold", size = 16),
+  axis.title.x = element_blank(),
+  axis.text.x.bottom = element_blank(),
+  axis.ticks.x.bottom = element_blank(),
+
+  axis.title.y = element_blank(),
+  axis.text.y.left = element_blank(),
+  axis.ticks.y.left = element_blank(),
+  axis.text.y.right = element_text(size = 12, margin = margin(l = 4)),
+
+  strip.text.y.left = element_text(
+    angle = 90, face = "bold", size = 18,
+    margin = margin(r = 10)
+  ),
+  strip.background = element_blank(),
+  strip.placement = "outside",
+
+  panel.spacing = unit(2.5, "lines"),
+
+  plot.margin = margin(20, 20, 20, 20),
+
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_line(color = "grey85", size = 0.4),
+
+  plot.caption = element_text(hjust = 0, size = 10)
+)
+
+
+# Print to the HTML/PDF output
+all_outcomes_box
+
+# # Save
+# ggsave(
+#   filename = here::here("outputs", "all_outcomes_box_scatter_example.png"),
+#   plot     = all_outcomes_box,
+#   width    = 10,
+#   height   = 15,
+#   units    = "in",
+#   dpi      = 1200
+# )
+
+
+```
+
+
+# Full Point Plot
+
+```{r full-point-plot, message=FALSE, warning=FALSE, fig.width=10, fig.height=20, results = 'asis'}
+light_berry <- lighten("#8D1D58", amount = 0.3)
+light_dblue <- lighten("#004F6E", amount = 0.4)
+light_lblue <- lighten("#00A5B5", amount = 0.2)
+test <- lighten("#e6652f", amount = 0.2)
+
+my_colors <- c(
+  "SMD"                                   = "#8ABB40",
+  "Cohen's U3"                            = light_dblue,
+  "CLES"                                  = "#FEE11A",
+  "Risk ratio"                            = "#FF7C4E",
+  "Number needed to treat"                = light_berry,
+  "IntHout probability of superiority"    = light_lblue
+)
+# Long data 
+plot_long <- rq4_df %>% 
+  select(
+    group,
+    effectiveness_cont,
+    precision_cont,
+    understandable,
+    helpful,
+    actionable,
+    concise,
+    credible,
+    recommendation
+  ) %>% 
+  pivot_longer(
+    cols = -group,
+    names_to = "outcome",
+    values_to = "score"
+  ) %>% 
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+      "actionable",
+      "concise",
+      "credible",
+      "helpful",
+      "precision_cont",
+      "understandable",
+      "effectiveness_cont",
+      "recommendation"
+    ),
+    labels = c(
+      "Actionable",
+      "Concise",
+      "Credible",
+      "Helpful",
+      "Precise",
+      "Understandable",
+      "Effective",
+      "Recommended"
+    )
+  ),
+    group = factor(
+      group,
+      levels = c(
+        "SMD",
+        "Cohen's U3",
+        "CLES",
+        "Risk ratio",
+        "Number needed to treat",
+        "IntHout probability of superiority"
+      )
+    )
+  )
+
+# Summary stats for mean + 95% CI 
+summary_long <- plot_long %>%
+  group_by(outcome, group) %>%
+  summarise(
+    mean  = mean(score, na.rm = TRUE),
+    se    = sd(score, na.rm = TRUE) / sqrt(sum(!is.na(score))),
+    n     = sum(!is.na(score)),
+    lower = mean - 1.96 * se,
+    upper = mean + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Plotmath labels for ES types (top x-axis, U3 subscript)
+es_label_map <- c(
+  "SMD"                                   = "SMD",
+  "Cohen's U3"                            = "U[3]",
+  "CLES"                                  = "CLES",
+  "Risk ratio"                            = "RR",
+  "Number needed to treat"                = "NNT",
+  "IntHout probability of superiority"    = "PSES"
+)
+es_breaks <- names(es_label_map)
+
+# Mean + CI + scatter plot 
+all_outcomes_mean_ci <- ggplot() +
+  
+  # Jitter points colored by group
+  geom_jitter(
+    data = plot_long,
+    aes(x = group, y = score, color = group),
+    width = 0.15,
+    alpha = 0.35,
+    size = 1.6,
+    show.legend = FALSE
+  ) +
+  
+  # Black CI bars
+  geom_errorbar(
+    data = summary_long,
+    aes(x = group, ymin = lower, ymax = upper),
+    width = 0.18,
+    linewidth = 1.1,
+    color = "black"
+  ) +
+  
+  # Black mean point
+  geom_point(
+    data = summary_long,
+    aes(x = group, y = mean),
+    size = 3.3,
+    color = "black"
+  ) +
+  
+  facet_wrap(
+    ~ outcome,
+    ncol = 2,
+    strip.position = "left"
+  ) +
+  
+  scale_x_discrete(
+    position = "top",
+    breaks   = es_breaks,
+    labels   = function(x) parse(text = es_label_map[x])
+  ) +
+  
+  scale_y_continuous(
+    limits   = c(0, 6.5),
+    breaks   = 0:6,
+    minor_breaks = NULL,
+    position = "right"
+  ) +
+  
+  scale_color_manual(values = my_colors) +
+  
+  labs(
+    x = NULL,
+    y = NULL,
+    caption = "Points = group means with 95% CI; jittered dots = individual ratings."
+  ) +
+  
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text.x.top = element_text(face = "bold", size = 16),
+    axis.text.y.left = element_blank(),
+    axis.ticks.y.left = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 90, face = "bold", size = 16),
+    panel.spacing = unit(1, "lines")
+  )
+  
+all_outcomes_mean_ci
+
+```
+
